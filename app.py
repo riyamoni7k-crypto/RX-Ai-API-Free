@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from flask import Flask, request, jsonify, render_template_string, make_response
 from flask_cors import CORS
 import google.generativeai as genai
@@ -7,7 +8,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# গ্লোবাল CORS কনফিগারেশন - সব ব্রাউজার এবং লোকাল ফাইল সাপোর্ট করবে
+# ফুল CORS সাপোর্ট নিশ্চিত করা যাতে লোকাল HTML বা অন্য ব্রাউজার থেকে রিকোয়েস্ট ব্লক না হয়
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ব্র্যান্ডিং এবং ডেভেলপার তথ্য
@@ -21,123 +22,116 @@ DEV_INFO = {
     }
 }
 
-# এআই মডেলের অগ্রাধিকার তালিকা (সবচেয়ে স্টেবল মডেলগুলো আগে রাখা হয়েছে)
-# gemini-1.5-flash বর্তমানে সবচেয়ে বেশি স্টেবল এবং দ্রুত
+# ২০২৬ সালের লেটেস্ট এবং স্টেবল মডেল লিস্ট
+# ১. gemini-2.0-flash: সুপার ফাস্ট এবং স্টেবল
+# ২. gemini-2.0-pro-exp-02-05: হাই-লেভেল কোডিং এবং রিসার্চের জন্য
 AI_MODELS = [
-    "gemini-1.5-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-pro",
-    "gemini-pro"
+    "gemini-2.0-flash", 
+    "gemini-2.0-pro-exp-02-05",
+    "gemini-1.5-flash-latest"
 ]
 
-def get_gemini_content(api_key, user_query):
-    """গুগল জেমিনি থেকে তথ্য সংগ্রহের মূল ইঞ্জিন (v1beta support)"""
-    error_log = []
+def get_ai_response(api_key, query):
+    """এটি ২০২৬ সালের লেটেস্ট এপিআই মেথড ব্যবহার করে রেসপন্স জেনারেট করে"""
+    error_list = []
     
-    # এপিআই কনফিগার করা
+    # এপিআই কি কনফিগার করা
     try:
         genai.configure(api_key=api_key)
     except Exception as e:
-        return None, f"Configuration Error: {str(e)}"
+        return None, f"API Configuration Failed: {str(e)}"
 
     for model_name in AI_MODELS:
         try:
-            # মডেল কল করা
+            # লেটেস্ট জেনারেটিভ মডেল অবজেক্ট তৈরি
             model = genai.GenerativeModel(
                 model_name=model_name,
-                system_instruction="You are RX PREMIUM ZONE AI, a high-level coding expert and general assistant. Provide accurate and clean responses."
+                system_instruction="You are RX PREMIUM ZONE AI, a professional developer assistant. Response must be high-quality and verified."
             )
             
-            # জেনারেশন কনফিগারেশন (Timeout এবং Error হ্যান্ডেল করার জন্য)
+            # জেনারেশন কনফিগারেশন (Safety settings এবং temperature অপ্টিমাইজড)
+            generation_config = {
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 8192,
+            }
+
+            # এপিআই কল করা (v1beta স্টাইল)
             response = model.generate_content(
-                user_query,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=2048,
-                    temperature=0.7,
-                )
+                query,
+                generation_config=generation_config
             )
             
             if response and response.text:
                 return response.text, model_name
                 
         except Exception as e:
-            # এররটি স্টোর করে রাখা হচ্ছে পরবর্তী মডেল ট্রাই করার জন্য
-            error_msg = str(e)
-            error_log.append(f"{model_name}: {error_msg}")
-            continue
+            error_list.append(f"{model_name}: {str(e)}")
+            continue # পরবর্তী মডেলে ফলব্যাক করবে
             
-    # যদি কোনো মডেলই কাজ না করে তবে বিস্তারিত এরর পাঠানো
-    return None, f"All models failed. Primary Error: {error_log[0] if error_log else 'Unknown API Error'}"
+    return None, f"সবগুলো মডেল ফেইল করেছে। এরর: {error_list[0] if error_list else 'API Key Invalid or Quota Exceeded'}"
 
+# ব্রাউজার সিকিউরিটি (CORS) এর জন্য কাস্টম হেডার মিডলওয়্যার
 @app.after_request
-def apply_headers(response):
-    """ব্রাউজার ব্লক এড়ানোর জন্য প্রোডাকশন লেভেল হেডার"""
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+def after_request_func(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
 @app.route('/', methods=['GET', 'POST'])
-def root_handler():
-    """হোমপেজ এবং স্মার্ট রিডাইরেক্ট হ্যান্ডলার"""
-    # যদি মেইন ইউআরএল-এ প্যারামিটার থাকে, তবে সরাসরি এপিআই লজিক প্রসেস করো
-    api_param = request.args.get('api') or (request.is_json and request.json.get('api'))
-    if api_param:
-        return handle_api_logic()
+def landing_page():
+    """স্মার্ট ইউআই যা এপিআই প্যারামিটার থাকলে সরাসরি রেসপন্স দিবে"""
+    api_key = request.args.get('api') or (request.json.get('api') if request.is_json else None)
+    ask_query = request.args.get('ask') or (request.json.get('ask') if request.is_json else None)
+
+    if api_key and ask_query:
+        return handle_logic(api_key, ask_query)
     
-    # নতুবা সুন্দর হোমপেজ দেখাও
-    return render_template_string(ULTIMATE_UI, dev=DEV_INFO)
+    # যদি প্যারামিটার না থাকে তবে সুন্দর ড্যাশবোর্ড দেখাবে
+    return render_template_string(UI_HTML, dev=DEV_INFO)
 
 @app.route('/api', methods=['GET', 'POST', 'OPTIONS'])
-def api_route():
-    """ডেডিকেটেড এপিআই এন্ডপয়েন্ট"""
-    return handle_api_logic()
-
-def handle_api_logic():
-    """এপিআই লজিক যা উভয় এন্ডপয়েন্টে কাজ করবে"""
+def api_endpoint():
+    """ডেডিকেটেড এপিআই গেটওয়ে"""
     if request.method == 'OPTIONS':
         return make_response('', 200)
 
-    # ডাটা সংগ্রহ
-    api_key = request.args.get('api')
-    prompt = request.args.get('ask')
+    api_key = request.args.get('api') or (request.json.get('api') if request.is_json else None)
+    ask_query = request.args.get('ask') or (request.json.get('ask') if request.is_json else None)
 
-    if request.is_json:
-        json_data = request.get_json(silent=True) or {}
-        api_key = api_key or json_data.get('api')
-        prompt = prompt or json_data.get('ask')
+    return handle_logic(api_key, ask_query)
 
-    # প্যারামিটার না থাকলে এরর
-    if not api_key or not prompt:
+def handle_logic(api_key, query):
+    """কোর এপিআই লজিক"""
+    if not api_key or not query:
         return jsonify({
             **DEV_INFO,
             "status": False,
-            "error": "Missing Parameters",
-            "message": "দয়া করে 'api' এবং 'ask' প্যারামিটার ব্যবহার করুন।",
-            "example": "/api?api=YOUR_KEY&ask=Hello"
+            "error": "Missing Information",
+            "message": "সঠিকভাবে রিকোয়েস্ট পাঠান। উদাহরণ: ?api=YOUR_KEY&ask=Hello"
         }), 400
 
-    # এআই প্রসেসিং
-    ai_text, used_model = get_gemini_content(api_key, prompt)
+    ai_text, model_id = get_ai_response(api_key, query)
 
     if ai_text:
         return jsonify({
             **DEV_INFO,
-            "model": used_model,
+            "model": model_id,
             "response": ai_text,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
     else:
-        # এখানে আপনার ফেইল হওয়া এররটি ডিটেইলসে দেখাবে
         return jsonify({
             **DEV_INFO,
             "status": False,
-            "error": "AI Processing Failed",
-            "details": used_model
+            "error": "AI Request Failed",
+            "details": model_id
         }), 500
 
-# অত্যন্ত প্রিমিয়াম এবং ডাইনামিক ইউআই (পূর্বের ইউআই থেকে আরও নিখুঁত)
-ULTIMATE_UI = """
+# ২০২৬ সালের প্রিমিয়াম ডার্ক নিওন ইউআই
+UI_HTML = """
 <!DOCTYPE html>
 <html lang="bn">
 <head>
@@ -145,124 +139,105 @@ ULTIMATE_UI = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ dev.developer }} | Premium AI Proxy</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Outfit:wght@300;400;600&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Quicksand:wght@300;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body { 
-            background: #02040a; 
-            color: #e6edf3; 
-            font-family: 'Outfit', sans-serif;
-            background-image: radial-gradient(circle at 50% 0%, #0d1117 0%, #02040a 100%);
-        }
-        .neon-text { text-shadow: 0 0 10px #2f81f7, 0 0 20px #2f81f7; }
-        .glass-card { 
-            background: rgba(22, 27, 34, 0.7); 
-            backdrop-filter: blur(15px); 
-            border: 1px solid rgba(48, 54, 61, 0.8);
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.8);
-        }
-        .code-font { font-family: 'Fira Code', monospace; }
+        body { background: #010409; color: #c9d1d9; font-family: 'Quicksand', sans-serif; overflow-x: hidden; }
         .orbitron { font-family: 'Orbitron', sans-serif; }
-        .btn-glow:hover { box-shadow: 0 0 20px rgba(47, 129, 247, 0.5); transform: translateY(-2px); }
-        .gradient-line { background: linear-gradient(90deg, transparent, #2f81f7, transparent); height: 1px; }
+        .neon-bg { background: linear-gradient(135deg, #007cf0 0%, #00dfd8 100%); }
+        .card-blur { background: rgba(13, 17, 23, 0.8); backdrop-filter: blur(15px); border: 1px solid rgba(48, 54, 61, 1); }
+        .neon-text { text-shadow: 0 0 10px #007cf0, 0 0 20px #007cf0; }
+        .btn-hover:hover { box-shadow: 0 0 25px rgba(0, 124, 240, 0.6); transform: translateY(-3px); transition: all 0.3s ease; }
+        pre { background: #0d1117; padding: 1rem; border-radius: 1rem; border: 1px solid #30363d; color: #58a6ff; font-family: monospace; }
     </style>
 </head>
-<body class="min-h-screen">
-
-    <div class="max-w-5xl mx-auto px-6 py-16">
-        <!-- Header -->
-        <header class="text-center mb-20">
-            <div class="inline-block px-3 py-1 mb-6 text-[10px] font-bold tracking-[0.2em] text-blue-400 uppercase border border-blue-500/30 rounded-full orbitron">
-                Production Ready Middleware
+<body class="min-h-screen relative">
+    
+    <!-- Hero Section -->
+    <div class="container mx-auto px-6 py-20 max-w-6xl relative z-10">
+        <header class="text-center mb-24">
+            <div class="inline-block px-4 py-1 mb-6 text-[10px] font-bold tracking-[0.3em] text-blue-400 uppercase border border-blue-500/30 rounded-full orbitron">
+                2026 NEXT-GEN MIDDLEWARE
             </div>
-            <h1 class="text-5xl md:text-7xl font-extrabold orbitron mb-6 tracking-tighter">
-                {{ dev.developer }} <br><span class="neon-text text-blue-500">AI PROXY</span>
+            <h1 class="text-6xl md:text-8xl font-black orbitron mb-6 neon-text text-white">
+                {{ dev.developer }}
             </h1>
-            <div class="gradient-line w-1/2 mx-auto mb-8"></div>
-            <p class="text-gray-400 text-lg max-w-2xl mx-auto font-light leading-relaxed">
-                আপনার ওয়েবসাইট বা অ্যাপের জন্য গুগল জেমিনি এআই ব্যবহারের সবচেয়ে সহজ এবং শক্তিশালী গেটওয়ে। 
-                CORS বা প্রক্সি ঝামেলা ভুলে যান, এখন সব হবে নিমিষেই।
+            <p class="text-xl text-gray-400 max-w-3xl mx-auto font-light leading-relaxed">
+                গুগল জেমিনি এপিআই-কে এখন সরাসরি এইচটিএমএল বা লোকাল প্রজেক্টে ব্যবহার করুন। 
+                কোনো CORS এরর নেই, কোনো সার্ভার সেটাপ নেই—সবই অটোমেটিক।
             </p>
         </header>
 
-        <!-- Main Content -->
-        <div class="grid md:grid-cols-2 gap-8 mb-20">
+        <!-- Documentation Grid -->
+        <div class="grid md:grid-cols-2 gap-10">
             <!-- Documentation -->
-            <div class="glass-card p-8 rounded-3xl">
-                <h3 class="text-xl font-bold mb-6 flex items-center gap-3 orbitron">
-                    <i class="fas fa-terminal text-blue-500"></i> API USAGE
+            <div class="card-blur p-10 rounded-[2.5rem] relative overflow-hidden group">
+                <div class="absolute top-0 right-0 w-32 h-32 bg-blue-500/10 rounded-full -mr-16 -mt-16 blur-3xl"></div>
+                <h3 class="text-2xl font-bold mb-8 orbitron flex items-center gap-4">
+                    <i class="fas fa-code text-blue-500"></i> API Endpoint
                 </h3>
                 
                 <div class="space-y-6">
                     <div>
-                        <label class="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2 block">GET Endpoint</label>
-                        <div class="bg-black/50 p-4 rounded-xl border border-white/5 code-font text-xs text-blue-300 break-all">
-                            {{ request.url_root }}api?api=YOUR_KEY&ask=Hello
-                        </div>
+                        <p class="text-xs font-bold text-gray-500 uppercase mb-3 tracking-widest">GET Request</p>
+                        <pre class="text-xs break-all">/api?api=YOUR_KEY&ask=Hello</pre>
                     </div>
-
                     <div>
-                        <label class="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2 block">POST Body (JSON)</label>
-                        <div class="bg-black/50 p-4 rounded-xl border border-white/5 code-font text-xs text-purple-300">
-                            {<br>
-                            &nbsp;&nbsp;"api": "YOUR_KEY",<br>
-                            &nbsp;&nbsp;"ask": "Solve a math problem"<br>
-                            }
-                        </div>
+                        <p class="text-xs font-bold text-gray-500 uppercase mb-3 tracking-widest">POST Payload (JSON)</p>
+                        <pre class="text-xs">
+{
+  "api": "GEMINI_API_KEY",
+  "ask": "Solve a coding problem"
+}</pre>
                     </div>
                 </div>
             </div>
 
-            <!-- Contact & Help -->
-            <div class="glass-card p-8 rounded-3xl flex flex-col justify-between">
+            <!-- Developer Contact -->
+            <div class="card-blur p-10 rounded-[2.5rem] flex flex-col justify-between">
                 <div>
-                    <h3 class="text-xl font-bold mb-6 flex items-center gap-3 orbitron">
-                        <i class="fas fa-headset text-blue-500"></i> SUPPORT
+                    <h3 class="text-2xl font-bold mb-6 orbitron flex items-center gap-4">
+                        <i class="fas fa-bolt text-yellow-500"></i> Support
                     </h3>
-                    <p class="text-sm text-gray-400 mb-8 leading-relaxed">
-                        আপনার এপিআই কি কাজ না করলে বা কোনো টেকনিক্যাল সাপোর্টের প্রয়োজন হলে সরাসরি আমাদের সাথে যোগাযোগ করুন। আমরা ২৪/৭ একটিভ আছি।
+                    <p class="text-gray-400 mb-8 leading-relaxed">
+                        এপিআই কাজ না করলে বা আপনার কাস্টম ফিচারের প্রয়োজন হলে সরাসরি আমাদের সাথে যোগাযোগ করুন। আমরা ২৪ ঘণ্টার মধ্যেই সাপোর্ট প্রদান করি।
                     </p>
                 </div>
                 
-                <div class="flex flex-col gap-3">
-                    <a href="https://t.me/Roman_no_1" class="bg-blue-600/10 hover:bg-blue-600/20 border border-blue-600/30 p-4 rounded-2xl flex items-center justify-between group transition btn-glow">
-                        <span class="font-bold tracking-wide">Telegram Channel</span>
-                        <i class="fab fa-telegram-plane group-hover:translate-x-1 transition"></i>
+                <div class="space-y-4">
+                    <a href="https://t.me/Roman_no_1" class="neon-bg p-5 rounded-2xl flex items-center justify-between text-black font-black uppercase tracking-wider btn-hover">
+                        Telegram Chat <i class="fab fa-telegram-plane"></i>
                     </a>
-                    <a href="https://wa.me/8801603410849" class="bg-green-600/10 hover:bg-green-600/20 border border-green-600/30 p-4 rounded-2xl flex items-center justify-between group transition">
-                        <span class="font-bold tracking-wide">WhatsApp Help</span>
-                        <i class="fab fa-whatsapp group-hover:translate-x-1 transition"></i>
+                    <a href="https://wa.me/8801603410849" class="bg-white/5 border border-white/10 p-5 rounded-2xl flex items-center justify-between font-bold text-green-400 btn-hover">
+                        WhatsApp Help <i class="fab fa-whatsapp"></i>
                     </a>
                 </div>
             </div>
         </div>
 
-        <!-- JSON Preview -->
-        <div class="glass-card p-10 rounded-[40px] border-blue-500/20">
-            <h3 class="text-lg font-bold mb-6 orbitron flex items-center gap-3">
-                <i class="fas fa-file-code text-blue-500"></i> API RESPONSE FORMAT
-            </h3>
-            <div class="bg-black/80 p-6 rounded-2xl border border-white/5 code-font text-sm leading-relaxed text-blue-100/80">
-                <pre>
+        <!-- JSON Showcase -->
+        <div class="mt-12 card-blur p-10 rounded-[2.5rem] border-blue-500/20">
+            <div class="flex items-center gap-3 mb-8">
+                <div class="w-3 h-3 bg-red-500 rounded-full"></div>
+                <div class="w-3 h-3 bg-yellow-500 rounded-full"></div>
+                <div class="w-3 h-3 bg-green-500 rounded-full"></div>
+                <span class="text-xs font-mono text-gray-500 ml-4 tracking-widest uppercase">Response.json</span>
+            </div>
+            <pre class="text-sm md:text-base leading-relaxed">
 {
   "status": true,
   "developer": "{{ dev.developer }}",
-  "model": "gemini-1.5-flash",
-  "response": "AI will return your answer here...",
-  "timestamp": "2024-05-20 14:30:15",
-  "contact": {
-      "telegram": "{{ dev.contact.telegram }}",
-      "channel": "{{ dev.contact.channel }}"
-  }
+  "model": "gemini-2.0-flash",
+  "response": "Hello Master! How can I assist you today?",
+  "timestamp": "2026-03-22 14:30:15",
+  "contact": { "telegram": "@Roman_no_1", ... }
 }</pre>
-            </div>
         </div>
 
         <!-- Footer -->
-        <footer class="mt-24 text-center">
-            <p class="text-[10px] tracking-[0.5em] text-gray-600 uppercase mb-4 orbitron font-bold">
-                &copy; 2024 {{ dev.developer }} | All Rights Reserved
-            </p>
+        <footer class="mt-32 text-center text-gray-600">
+            <p class="orbitron font-bold text-[10px] tracking-[0.5em] uppercase mb-4">Official RX Premium AI Proxy</p>
+            <p class="text-[10px] uppercase tracking-widest">© 2026 {{ dev.developer }} All Rights Reserved</p>
         </footer>
     </div>
 
